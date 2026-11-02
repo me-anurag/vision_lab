@@ -1,6 +1,7 @@
 import json
 import re
 import shutil
+import time
 import unicodedata
 from pathlib import Path
 
@@ -25,6 +26,19 @@ def sanitize_name(name: str) -> str:
     if safe in RESERVED_NAMES:
         safe += "_"
     return safe
+
+
+def replace_file(src: Path, dest: Path, attempts=10, delay=0.05):
+    """os.replace with retries: on Windows it fails while another program (antivirus,
+    indexer, an editor) briefly has the target open."""
+    for attempt in range(attempts):
+        try:
+            src.replace(dest)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 class FaceStore:
@@ -57,11 +71,11 @@ class FaceStore:
         tmp = self.embeddings_path.with_name("embeddings.tmp.npz")
         with open(tmp, "wb") as f:
             np.savez(f, **self.embeddings)
-        tmp.replace(self.embeddings_path)
+        replace_file(tmp, self.embeddings_path)
 
         tmp = self.people_path.with_name("people.tmp.json")
         tmp.write_text(json.dumps(self.names, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.people_path)
+        replace_file(tmp, self.people_path)
 
     def safe_name_for(self, name: str) -> str:
         """Folder name for a display name: the existing one if this exact name is
