@@ -2,7 +2,26 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QObject, Slot
 from PySide6.QtGui import QImage
+
+
+class UiCallback(QObject):
+    """Runs a callback on the UI thread when a worker-thread signal fires.
+
+    Connecting a worker's signal straight to a plain Python method runs that method
+    on the worker's thread. Create this on the UI thread and connect to `call` instead:
+        self.relay = UiCallback(self._on_result)
+        worker.result.connect(self.relay.call)
+    """
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+
+    @Slot(object)
+    def call(self, value):
+        self._callback(value)
 
 
 def frame_to_qimage(frame: np.ndarray) -> QImage:
