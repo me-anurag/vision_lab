@@ -20,3 +20,16 @@ class FaceRecognizer:
         """Return the L2-normalized 128-d embedding of an aligned crop."""
         feature = self._recognizer.feature(crop).flatten().astype(np.float32)
         return feature / np.linalg.norm(feature)
+
+    @staticmethod
+    def match(embedding: np.ndarray, gallery: np.ndarray, names: list[str]) -> tuple[str | None, float]:
+        """Best cosine score of `embedding` against every stored embedding.
+
+        `gallery` is (M, 128) with one name per row. Embeddings are L2-normalized,
+        so the cosine similarity is a dot product. Returns (name, score).
+        """
+        if len(gallery) == 0:
+            return None, 0.0
+        scores = gallery @ embedding
+        best = int(np.argmax(scores))
+        return names[best], float(scores[best])

@@ -1,10 +1,10 @@
 import logging
+import time
 from pathlib import Path
 
-import cv2
 import numpy as np
-from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QRect, QThread, QTimer, Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSlider,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -25,7 +27,7 @@ from core.utils import UiCallback, frame_to_qimage
 from modules.face_recognition.detector import FaceDetector
 from modules.face_recognition.recognizer import FaceRecognizer
 from modules.face_recognition.storage import FaceStore
-from modules.face_recognition.worker import FaceWorker
+from modules.face_recognition.worker import CAPTURE, DETECT, RECOGNIZE, FaceWorker
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +38,29 @@ RECOGNIZER_MODEL = ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 
 TARGET_SAMPLES = 15
 AUTO_CAPTURE_MS = 500
-GREEN, RED = (0, 200, 0), (0, 0, 255)
+DEFAULT_THRESHOLD = 0.363  # SFace cosine threshold from OpenCV
+GREEN, RED = QColor(0, 180, 0), QColor(220, 0, 0)
+ENROLL_TAB, RECOGNIZE_TAB = 0, 1
+
+
+class FpsCounter:
+    """Counts events and reports the rate about once per second."""
+
+    def __init__(self):
+        self.fps = 0.0
+        self._count = 0
+        self._start = time.perf_counter()
+
+    def tick(self) -> bool:
+        """Count one event. Returns True when `fps` was just updated."""
+        self._count += 1
+        elapsed = time.perf_counter() - self._start
+        if elapsed < 1.0:
+            return False
+        self.fps = self._count / elapsed
+        self._count = 0
+        self._start = time.perf_counter()
+        return True
 
 
 class FaceRecognitionModule(BaseModule):
@@ -52,8 +76,15 @@ class FaceRecognitionModule(BaseModule):
         self._busy = False             # a frame is being processed by the worker
         self._capture_pending = False  # the next frame sent to the worker is a capture
         self._capture_name = None      # name at the time the in-flight capture was sent
-        self._faces = np.empty((0, 15), np.float32)  # latest detections, drawn on every frame
         self._session_count = 0        # samples captured for the current name
+        self._gallery_empty = True     # nobody enrolled (Recognize shows a hint)
+        self._frames_since_recognize = 0
+        self._clear_result()
+
+    def _clear_result(self):
+        # Latest worker result, drawn on every frame until the next one arrives.
+        self._faces = np.empty((0, 15), np.float32)
+        self._matches = None
 
     # ----- UI -----
 
@@ -72,6 +103,8 @@ class FaceRecognitionModule(BaseModule):
         self.tabs = QTabWidget()
         self.tabs.setFixedWidth(320)
         self.tabs.addTab(self._build_enroll_tab(), "Enroll")
+        self.tabs.addTab(self._build_recognize_tab(), "Recognize")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
 
         self.auto_timer = QTimer(widget)
@@ -122,6 +155,39 @@ class FaceRecognitionModule(BaseModule):
         layout.addWidget(self.delete_button)
         return tab
 
+    def _build_recognize_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        self.threshold_label = QLabel()
+        layout.addWidget(self.threshold_label)
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(0, 1000)
+        self.threshold_slider.setValue(round(DEFAULT_THRESHOLD * 1000))
+        self.threshold_slider.valueChanged.connect(self._update_threshold_label)
+        layout.addWidget(self.threshold_slider)
+        self._update_threshold_label()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Recognize every"))
+        self.every_n = QSpinBox()
+        self.every_n.setRange(1, 30)
+        self.every_n.setValue(1)
+        self.every_n.setSuffix(" frame(s)")
+        row.addWidget(self.every_n)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.fps_label = QLabel("FPS: –")
+        self.fps_label.setStyleSheet("font-size: 15px; font-weight: bold;")
+        layout.addWidget(self.fps_label)
+
+        self.recognize_status = QLabel()
+        self.recognize_status.setWordWrap(True)
+        layout.addWidget(self.recognize_status)
+        layout.addStretch()
+        return tab
+
     def _refresh_people(self):
         self.people_list.clear()
         for safe, display, count in self.store.people():
@@ -136,9 +202,19 @@ class FaceRecognitionModule(BaseModule):
         capturing = self.auto_check.isChecked() or 0 < self._session_count < TARGET_SAMPLES
         self.hint_label.setVisible(capturing)
 
-    def _set_status(self, text, warning=False):
-        self.status_label.setStyleSheet("color: #d93025;" if warning else "color: #188038;")
-        self.status_label.setText(text)
+    def _update_threshold_label(self):
+        self.threshold_label.setText(f"Match threshold: {self._threshold():.3f}")
+
+    def _threshold(self):
+        return self.threshold_slider.value() / 1000
+
+    def _set_status(self, text, warning=False, label=None):
+        label = label or self.status_label
+        label.setStyleSheet("color: #d93025;" if warning else "color: #188038;")
+        label.setText(text)
+
+    def _recognize_mode(self):
+        return self.tabs.currentIndex() == RECOGNIZE_TAB
 
     # ----- lifecycle -----
 
@@ -153,8 +229,12 @@ class FaceRecognitionModule(BaseModule):
         self._active = True
         self._busy = False
         self._capture_pending = False
-        self._faces = np.empty((0, 15), np.float32)
+        self._clear_result()
+        self._video_fps, self._recognition_fps = FpsCounter(), FpsCounter()
+        self._frames_since_recognize = self.every_n.value()  # recognize the first frame
         self.worker_thread.start()
+        if self._recognize_mode():
+            self._send_gallery()
         self.video.setText("Starting camera…")
         self.camera.frame_ready.connect(self._on_frame)
         self.camera.error.connect(self._on_camera_error)
@@ -184,44 +264,139 @@ class FaceRecognitionModule(BaseModule):
         self.result_relay = UiCallback(self._on_result)
         self.worker.result.connect(self.result_relay.call)
 
+    def _on_tab_changed(self, index):
+        self.auto_check.setChecked(False)
+        self._capture_pending = False
+        self._clear_result()
+        if self._active and index == RECOGNIZE_TAB:
+            self._frames_since_recognize = self.every_n.value()
+            self._send_gallery()
+
+    def _send_gallery(self):
+        """Give the worker the current enrolled embeddings."""
+        gallery, names = self.store.gallery()
+        self._gallery_empty = not names
+        self.worker.set_gallery.emit(gallery, names)
+        if self._gallery_empty:
+            self._set_status("Enroll someone first.", warning=True, label=self.recognize_status)
+        else:
+            people = len(self.store.people())
+            self._set_status(f"{people} {'person' if people == 1 else 'people'} enrolled.",
+                             label=self.recognize_status)
+
     # ----- frames and results -----
 
     def _on_frame(self, frame):
         if not self._active:
             return
+        if self._video_fps.tick():
+            self._update_fps_label()
+        self._frames_since_recognize += 1
         if not self._busy:
-            self._busy = True
-            capture, self._capture_pending = self._capture_pending, False
-            if capture:
-                self._capture_name = self._name()
-            self.worker.request.emit(frame, capture)
+            task = self._next_task()
+            if task is not None:
+                self._busy = True
+                self.worker.request.emit(frame, task)
         self._show(frame)
 
-    def _show(self, frame):
-        view = frame.copy()
-        color = GREEN if len(self._faces) == 1 else RED
-        for face in self._faces:
-            x, y, w, h = face[:4].astype(int)
-            cv2.rectangle(view, (x, y), (x + w, y + h), color, 2)
-        pixmap = QPixmap.fromImage(frame_to_qimage(view))
-        self.video.setPixmap(
-            pixmap.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
+    def _next_task(self):
+        """What the worker should do with the current frame (None: reuse the last result)."""
+        if self._recognize_mode():
+            if self._gallery_empty:
+                return DETECT
+            if self._frames_since_recognize >= self.every_n.value():
+                self._frames_since_recognize = 0
+                return RECOGNIZE
+            return None
+        if self._capture_pending:
+            self._capture_pending = False
+            self._capture_name = self._name()
+            return CAPTURE
+        return DETECT
+
+    def _update_fps_label(self):
+        text = f"FPS: video {self._video_fps.fps:.1f}"
+        if self._recognize_mode() and not self._gallery_empty:
+            text += f"  ·  recognition {self._recognition_fps.fps:.1f}"
+        self.fps_label.setText(text)
+
+    def _on_result(self, res):
+        if not self._active:
+            return
+        self._busy = False
+        if res.error:
+            label = self.recognize_status if self._recognize_mode() else self.status_label
+            self._set_status(f"Processing error: {res.error}", warning=True, label=label)
+            return
+        if res.task == CAPTURE and self._recognize_mode():
+            return  # sent before switching tabs
+        if res.task == RECOGNIZE and not self._recognize_mode():
+            return  # sent before switching tabs
+        self._faces, self._matches = res.faces, res.matches
+        if res.task == RECOGNIZE:
+            self._recognition_fps.tick()
+        elif res.task == CAPTURE:
+            self._handle_capture(res)
 
     def _on_camera_error(self, message):
         self.auto_check.setChecked(False)
         self.video.clear()
         self.video.setText(message)
 
-    def _on_result(self, res):
-        if not self._active:
-            return
-        self._busy = False
-        self._faces = res.faces
-        if res.error:
-            self._set_status(f"Processing error: {res.error}", warning=True)
-        elif res.capture:
-            self._handle_capture(res)
+    # ----- drawing -----
+
+    def _show(self, frame):
+        image = frame_to_qimage(frame)
+        painter = QPainter(image)
+        font = QFont()
+        font.setPixelSize(max(14, image.height() // 28))
+        font.setBold(True)
+        painter.setFont(font)
+
+        if not self._recognize_mode():
+            color = GREEN if len(self._faces) == 1 else RED
+            for face in self._faces:
+                self._draw_box(painter, face, color)
+        elif self._gallery_empty:
+            for face in self._faces:
+                self._draw_box(painter, face, RED)
+            self._draw_banner(painter, image.width(), "Enroll someone first")
+        elif self._matches is not None:
+            threshold = self._threshold()
+            for face, (name, score) in zip(self._faces, self._matches):
+                if score >= threshold:
+                    self._draw_box(painter, face, GREEN, f"{name} {score:.2f}")
+                else:
+                    self._draw_box(painter, face, RED, "Unknown")
+        painter.end()
+
+        pixmap = QPixmap.fromImage(image)
+        self.video.setPixmap(
+            pixmap.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+    @staticmethod
+    def _draw_box(painter, face, color, text=None):
+        x, y, w, h = (int(v) for v in face[:4])
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(x, y, w, h)
+        if text:
+            metrics = painter.fontMetrics()
+            tw, th = metrics.horizontalAdvance(text) + 10, metrics.height() + 4
+            ty = y - th if y - th >= 0 else y  # above the box, or inside it at the top edge
+            painter.fillRect(x, ty, tw, th, color)
+            painter.setPen(Qt.white)
+            painter.drawText(QRect(x, ty, tw, th), Qt.AlignCenter, text)
+
+    @staticmethod
+    def _draw_banner(painter, width, text):
+        metrics = painter.fontMetrics()
+        tw, th = metrics.horizontalAdvance(text) + 24, metrics.height() + 12
+        rect = QRect((width - tw) // 2, 12, tw, th)
+        painter.fillRect(rect, QColor(0, 0, 0, 170))
+        painter.setPen(Qt.white)
+        painter.drawText(rect, Qt.AlignCenter, text)
 
     # ----- enrollment -----
 

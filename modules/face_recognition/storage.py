@@ -112,6 +112,16 @@ class FaceStore:
         self.embeddings.pop(safe, None)
         self.save()
 
+    def gallery(self) -> tuple[np.ndarray, list[str]]:
+        """All stored embeddings as one (M, 128) array, with the display name of each row."""
+        rows, names = [], []
+        for safe, embeddings in self.embeddings.items():
+            rows.append(embeddings)
+            names += [self.names.get(safe, safe)] * len(embeddings)
+        if not rows:
+            return np.empty((0, 128), np.float32), []
+        return np.vstack(rows), names
+
     def people(self) -> list[tuple[str, str, int]]:
         """(safe_name, display_name, sample_count) for everyone, sorted by display name."""
         rows = [
