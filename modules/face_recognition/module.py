@@ -96,6 +96,7 @@ class FaceRecognitionModule(BaseModule):
 
         self.video = QLabel()
         self.video.setAlignment(Qt.AlignCenter)
+        self.video.setWordWrap(True)
         self.video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video.setStyleSheet("background: black; color: white; font-size: 16px;")
         layout.addWidget(self.video, stretch=1)
@@ -219,12 +220,12 @@ class FaceRecognitionModule(BaseModule):
     # ----- lifecycle -----
 
     def on_open(self):
-        try:
-            self._ensure_worker()
-        except Exception as exc:
-            log.exception("Could not load face models")
-            self.video.setText(f"Could not load face models:\n{exc}")
+        error = self._ensure_worker()
+        self.tabs.setEnabled(error is None)
+        if error is not None:
+            self.video.setText(error)
             return
+        self._check_data_writable()
 
         self._active = True
         self._busy = False
@@ -253,16 +254,49 @@ class FaceRecognitionModule(BaseModule):
         self.video.clear()
 
     def _ensure_worker(self):
+        """Load the models and create the worker once. Returns an error message, or None."""
         if self.worker is not None:
-            return
-        detector = FaceDetector(DETECTOR_MODEL)
-        recognizer = FaceRecognizer(RECOGNIZER_MODEL)
+            return None
+        missing = [p.name for p in (DETECTOR_MODEL, RECOGNIZER_MODEL) if not p.exists()]
+        if missing:
+            return (
+                "Face models not found:\n" + "\n".join(missing) + "\n\n"
+                "Download them once with:\n    python scripts/download_models.py"
+            )
+        try:
+            detector = FaceDetector(DETECTOR_MODEL)
+            recognizer = FaceRecognizer(RECOGNIZER_MODEL)
+        except Exception as exc:
+            log.exception("Could not load face models")
+            return (
+                f"Could not load the face models:\n{exc}\n\n"
+                "Delete the models folder and download them again with:\n"
+                "    python scripts/download_models.py"
+            )
         self.worker = FaceWorker(detector, recognizer)
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
         # Deliver results on the UI thread (see UiCallback).
         self.result_relay = UiCallback(self._on_result)
         self.worker.result.connect(self.result_relay.call)
+        return None
+
+    def _check_data_writable(self):
+        """Enrolling needs to write to data/; recognition only reads."""
+        try:
+            self.store.check_writable()
+            writable = True
+        except OSError as exc:
+            log.error("Data folder %s is not writable: %s", DATA_DIR, exc)
+            writable = False
+            self._set_status(
+                f"Can't write to {DATA_DIR}:\n{exc}\n\n"
+                "Enrolling is disabled. Check the folder's permissions. Recognition still works.",
+                warning=True,
+            )
+        self.capture_button.setEnabled(writable)
+        self.auto_check.setEnabled(writable)
+        self.delete_button.setEnabled(writable)
 
     def _on_tab_changed(self, index):
         self.auto_check.setChecked(False)
@@ -454,7 +488,7 @@ class FaceRecognitionModule(BaseModule):
             total = self.store.add_sample(name, res.crop, res.embedding)
         except OSError as exc:
             log.exception("Could not save face sample")
-            self._set_status(f"Could not save sample: {exc}", warning=True)
+            self._set_status(f"Could not save to {DATA_DIR}:\n{exc}", warning=True)
             self.auto_check.setChecked(False)
             return
 

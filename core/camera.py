@@ -45,7 +45,8 @@ class Camera(QThread):
                 log.error("Could not open camera %d", self.index)
                 self.error.emit(
                     f"No camera found (index {self.index}).\n"
-                    "Check that a webcam is connected and not used by another app."
+                    "Check that a webcam is connected and not used by another app,\n"
+                    "then go back to the hub and open the module again."
                 )
                 return
 
@@ -56,7 +57,10 @@ class Camera(QThread):
                     failed += 1
                     if failed >= MAX_FAILED_READS:
                         log.error("Camera %d stopped delivering frames", self.index)
-                        self.error.emit("Camera disconnected or not delivering frames.")
+                        self.error.emit(
+                            "Camera disconnected or not delivering frames.\n"
+                            "Reconnect it, then go back to the hub and open the module again."
+                        )
                         return
                     time.sleep(0.05)
                     continue

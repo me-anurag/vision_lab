@@ -59,11 +59,27 @@ class FaceStore:
         self.load()
 
     def load(self):
-        if self.people_path.exists():
-            self.names = json.loads(self.people_path.read_text(encoding="utf-8"))
-        if self.embeddings_path.exists():
-            with np.load(self.embeddings_path) as npz:
-                self.embeddings = {key: npz[key] for key in npz.files}
+        try:
+            if self.people_path.exists():
+                self.names = json.loads(self.people_path.read_text(encoding="utf-8"))
+            if self.embeddings_path.exists():
+                with np.load(self.embeddings_path) as npz:
+                    self.embeddings = {key: npz[key] for key in npz.files}
+        except Exception as exc:
+            # Don't start empty: the next save would overwrite the person's data.
+            raise RuntimeError(
+                f"Could not read the saved faces in {self.data_dir}.\n"
+                "embeddings.npz or people.json may be damaged. Move them out of the folder\n"
+                "(or restore a backup) and open the module again.\n\n"
+                f"Details: {exc}"
+            ) from exc
+
+    def check_writable(self):
+        """Raise OSError if data/ cannot be written."""
+        self.faces_dir.mkdir(parents=True, exist_ok=True)
+        probe = self.data_dir / ".write_test"
+        probe.write_bytes(b"")
+        probe.unlink()
 
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)

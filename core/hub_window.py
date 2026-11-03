@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -134,8 +135,9 @@ class HubWindow(QMainWindow):
         if module not in self.module_pages:
             try:
                 page = self._build_module_page(module)
-            except Exception:
+            except Exception as exc:
                 log.exception("Failed to build UI for module %r", module.name)
+                QMessageBox.critical(self, "Module error", f"Could not open {module.name}:\n\n{exc}")
                 return
             self.module_pages[module] = page
             self.stack.addWidget(page)
